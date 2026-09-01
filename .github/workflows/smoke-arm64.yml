@@ -65,21 +65,30 @@ jobs:
 
           echo "=== [4] 判定 ==="
           RESULT=PASS
-          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed" "$LOGS/all.log"; then
+          # 4a. 致命错误/崩溃信号 → 直接 FAIL（真·运行时问题）
+          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/all.log"; then
             RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
           fi
-          if grep -qiE "LogInit.*Engine is initialized|LogInit.*CommandLine|LogLoad.*Initialized" "$LOGS/all.log"; then
-            echo "✅ 引擎初始化成功"
+          # 4b. 引擎初始化（核心目标：产物能否在 ARM64 启动）
+          ENGINE_OK=0
+          if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/all.log"; then
+            ENGINE_OK=1; echo "✅ 引擎初始化成功（产物可在 ARM64 正常启动）"
           else
             RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
           fi
-          if grep -qiE "LogPakFile.*[Mm]ount|LogPakFile: Display" "$LOGS/all.log"; then
+          # 4c. pak 挂载
+          if grep -qiE "LogPakFile.*[Mm]ount" "$LOGS/all.log"; then
             echo "✅ pak 挂载成功"
           else
             echo "⚠️ 未检测到 pak 挂载日志"
           fi
-          if [ $((END-START)) -lt 10 ]; then
-            RESULT=FAIL; echo "⚠️ 运行不足 10 秒即退出"
+          # 4d. 地图缺失 = 内容问题（空工程未 cook 默认地图），非运行时崩溃 → 提示不判 FAIL
+          if grep -qiE "could not be found. Exiting|Failed to enter" "$LOGS/all.log"; then
+            echo "⚠️ 默认地图缺失（内容问题）：引擎正常初始化后因找不到 GameDefaultMap 退出，非运行时崩溃"
+          fi
+          # 4e. 运行时长：仅当引擎未初始化成功且运行过短，才判 FAIL（正常快速退出不误伤）
+          if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
+            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
           fi
           echo "SMOKE_RESULT=$RESULT" >> "$GITHUB_ENV"
           echo "=== 判定结果: $RESULT ==="
