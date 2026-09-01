@@ -57,6 +57,9 @@ jobs:
           END=$(date +%s)
           cd "$GITHUB_WORKSPACE"
           echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
+          # 关键修复：xvfb-run 收到 SIGTERM 后会先退出，Arm64Probe 子进程仍在后台优雅关闭并 flush stdout；
+          # 立即汇总会拿到截断日志（缺 "Game Engine Initialized"）→ 误判 FAIL。等待日志完整落盘。
+          sleep 5
 
           echo "=== [3] 汇总 UE 日志 ==="
           cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
@@ -65,28 +68,35 @@ jobs:
 
           echo "=== [4] 判定 ==="
           RESULT=PASS
+          # 判定同时 grep console.log（stdout 直出）与 all.log（汇总），任一命中即有效，避免单文件截断
           # 4a. 致命错误/崩溃信号 → 直接 FAIL（真·运行时问题）
-          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/all.log"; then
+          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/console.log" "$LOGS/all.log"; then
             RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
           fi
           # 4b. 引擎初始化（核心目标：产物能否在 ARM64 启动）
           ENGINE_OK=0
-          if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/all.log"; then
+          if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/console.log" "$LOGS/all.log"; then
             ENGINE_OK=1; echo "✅ 引擎初始化成功（产物可在 ARM64 正常启动）"
           else
             RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
           fi
           # 4c. pak 挂载
-          if grep -qiE "LogPakFile.*[Mm]ount" "$LOGS/all.log"; then
+          if grep -qiE "LogPakFile.*[Mm]ount" "$LOGS/console.log" "$LOGS/all.log"; then
             echo "✅ pak 挂载成功"
           else
             echo "⚠️ 未检测到 pak 挂载日志"
           fi
-          # 4d. 地图缺失 = 内容问题（空工程未 cook 默认地图），非运行时崩溃 → 提示不判 FAIL
-          if grep -qiE "could not be found. Exiting|Failed to enter" "$LOGS/all.log"; then
+          # 4d. D1 地图加载（本次重打包核心目标：验证 D1 在 ARM64 正常加载 → 缺失判 FAIL）
+          if grep -qiE "Bringing World .*D1|LoadMap.*D1" "$LOGS/console.log" "$LOGS/all.log"; then
+            echo "✅ 默认地图 D1 加载成功"
+          else
+            RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志（D1 可能未进 pak 或加载失败）"
+          fi
+          # 4e. 地图缺失 = 内容问题（空工程未 cook 默认地图），非运行时崩溃 → 提示不判 FAIL
+          if grep -qiE "could not be found. Exiting|Failed to enter" "$LOGS/console.log" "$LOGS/all.log"; then
             echo "⚠️ 默认地图缺失（内容问题）：引擎正常初始化后因找不到 GameDefaultMap 退出，非运行时崩溃"
           fi
-          # 4e. 运行时长：仅当引擎未初始化成功且运行过短，才判 FAIL（正常快速退出不误伤）
+          # 4f. 运行时长：仅当引擎未初始化成功且运行过短，才判 FAIL（正常快速退出不误伤）
           if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
             RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
           fi
