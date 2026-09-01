@@ -1,9 +1,9 @@
 # ============================================================================
-# ARM64 冒烟测试工作流
+# ARM64 冒烟测试工作流（自包含版，无需仓库内 smoke.sh）
 # 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB）上运行打包产物
-# - 公开仓库: 免费且无限量
-# - 私有仓库: 消耗免费分钟额度（2000 分钟/月）
+# - 公开仓库: 免费且无限量；私有仓库: 消耗免费分钟额度（2000 分钟/月）
 # 触发方式: 手动 (Actions 页面 -> Run workflow) 或 push 到 main/master
+# 要求: 仓库 Release 中必须有 Arm64Probe-LinuxAArch64.tar.gz
 # ============================================================================
 name: ARM64 Smoke Test
 
@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 从 Release 下载产物包
         run: |
@@ -36,17 +36,68 @@ jobs:
 
       - name: 运行冒烟测试
         run: |
-          chmod +x smoke.sh
-          ./smoke.sh
-        continue-on-error: true    # 冒烟失败不中断，仍上传日志
+          set +e
+          BIN_DIR="Arm64Probe/Binaries/LinuxAArch64"
+          LOGS="$GITHUB_WORKSPACE/logs"
+          mkdir -p "$LOGS"
 
-      - name: 上传日志（无论成败）
+          echo "=== [1] 安装无头运行依赖 ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libsdl2-2.0-0 >/dev/null 2>&1 || true
+
+          echo "=== [2] 无头启动（-nullrhi, 超时 180s）==="
+          chmod +x "$BIN_DIR/Arm64Probe"
+          export SDL_VIDEODRIVER=dummy
+          export SDL_AUDIODRIVER=dummy
+          cd "$BIN_DIR"                                  # 与官方 .sh 启动脚本一致
+          START=$(date +%s)
+          timeout 180 xvfb-run -a ./Arm64Probe -nullrhi -noaudio -nosound -unattended -log \
+            > "$LOGS/console.log" 2>&1
+          RC=$?
+          END=$(date +%s)
+          cd "$GITHUB_WORKSPACE"
+          echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
+
+          echo "=== [3] 汇总 UE 日志 ==="
+          cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
+          cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
+          tail -60 "$LOGS/all.log"
+
+          echo "=== [4] 判定 ==="
+          RESULT=PASS
+          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed" "$LOGS/all.log"; then
+            RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
+          fi
+          if grep -qiE "LogInit.*Engine is initialized|LogInit.*CommandLine|LogLoad.*Initialized" "$LOGS/all.log"; then
+            echo "✅ 引擎初始化成功"
+          else
+            RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
+          fi
+          if grep -qiE "LogPakFile.*[Mm]ount|LogPakFile: Display" "$LOGS/all.log"; then
+            echo "✅ pak 挂载成功"
+          else
+            echo "⚠️ 未检测到 pak 挂载日志"
+          fi
+          if [ $((END-START)) -lt 10 ]; then
+            RESULT=FAIL; echo "⚠️ 运行不足 10 秒即退出"
+          fi
+          echo "SMOKE_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "=== 判定结果: $RESULT ==="
+
+      - name: 上传完整日志（无论成败）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ue-logs
-          path: |
-            /tmp/arm64_smoke_console.log
-            /tmp/arm64_smoke_all.log
-            ${{ runner.home }}/Documents/Arm64Probe/Saved/Logs/
+          path: logs/
           if-no-files-found: warn
+
+      - name: 汇总冒烟结果
+        if: always()
+        run: |
+          echo "冒烟结果: ${{ env.SMOKE_RESULT }}"
+          if [ "${{ env.SMOKE_RESULT }}" = "FAIL" ]; then
+            echo "❌ 冒烟未通过，请下载 ue-logs 工件查看完整日志"
+            exit 1
+          fi
+          echo "✅ 冒烟通过"
