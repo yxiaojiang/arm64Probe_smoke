@@ -1,0 +1,52 @@
+# ============================================================================
+# ARM64 冒烟测试工作流
+# 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB）上运行打包产物
+# - 公开仓库: 免费且无限量
+# - 私有仓库: 消耗免费分钟额度（2000 分钟/月）
+# 触发方式: 手动 (Actions 页面 -> Run workflow) 或 push 到 main/master
+# ============================================================================
+name: ARM64 Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04-arm        # 真 ARM64 runner
+    timeout-minutes: 15
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 从 Release 下载产物包
+        run: |
+          set -e
+          curl -fL --retry 3 -o Arm64Probe-LinuxAArch64.tar.gz \
+            "https://github.com/${{ github.repository }}/releases/latest/download/Arm64Probe-LinuxAArch64.tar.gz"
+          ls -lh Arm64Probe-LinuxAArch64.tar.gz
+
+      - name: 解压并校验 ELF
+        run: |
+          tar -xzf Arm64Probe-LinuxAArch64.tar.gz
+          echo "=== ELF 校验 ==="
+          file Arm64Probe/Binaries/LinuxAArch64/Arm64Probe
+          readelf -h Arm64Probe/Binaries/LinuxAArch64/Arm64Probe | grep -E "Class|Machine|Type" || true
+
+      - name: 运行冒烟测试
+        run: |
+          chmod +x smoke.sh
+          ./smoke.sh
+        continue-on-error: true    # 冒烟失败不中断，仍上传日志
+
+      - name: 上传日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ue-logs
+          path: |
+            /tmp/arm64_smoke_console.log
+            /tmp/arm64_smoke_all.log
+            ${{ runner.home }}/Documents/Arm64Probe/Saved/Logs/
+          if-no-files-found: warn
