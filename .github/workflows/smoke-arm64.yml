@@ -1,18 +1,19 @@
 # ============================================================================
-# Arm64Probe - 兼容包双路冒烟测试工作流 v5（自包含版，无需仓库内 .sh）
+# Arm64Probe - 兼容包双路冒烟测试工作流 v7（自包含版，无需仓库内 .sh）
 # 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB, ubuntu-24.04）上运行打包产物
 #
-# v5 修复（针对 2026-09-02 首跑 GL job 引擎秒死无日志的排障迭代）:
-#   1. 修正 UE 自带日志(Saved/Logs)抓取路径: 打包游戏日志在解压根目录下的
-#      Arm64Probe/Saved/Logs/, 旧版写 $HOME/Documents/... 路径错误从未抓到
-#   2. 退出码写入工件文件 exitcode.txt (137=SIGKILL/OOM, 139=SIGSEGV, 132=SIGILL)
-#   3. Job2 启动前做环境自检(envcheck.txt): xdpyinfo/glxinfo/ldconfig/llvmpipe
-#   4. 进程退出后抓 dmesg/journalctl 查 OOM killer 痕迹
+# v5 修复: UE 日志抓取路径(Saved/Logs) + exitcode.txt + envcheck + dmesg
+# v6 修复: strace 探针定位无声 exit(1) + -NOSPLASH + core dump
+# v7 定案（源码证实）: 4.24 Linux【不存在 Vulkan 失败自动降级 GL 的机制】!
+#   - VulkanRHI IsSupported() 只检查 DISPLAY/Wayland 环境变量(Linux 平台),
+#     完全不探测 ICD 驱动是否存在 -> 有显示环境必选 Vulkan -> 无 ICD 即弹窗退出
+#   - OpenGLDrv IsSupported() 恒为 true
+#   -> 兼容包必须加 -opengl 显式强制 OpenGL 路径(GLSL_430), 这才是唯一活路
+#   -> 现场飞腾 X100 同理: 启动命令必须带 -opengl
 #
 # Job 1 smoke-nullrhi : 无头启动（-nullrhi），验证产物可启动 + D1 地图加载
-# Job 2 smoke-gl      : 真实 RHI 启动。故意【不安装】Vulkan 驱动，只装 mesa 软件 GL
-#                       -> 引擎应报 Vulkan 初始化失败 -> 自动降级 OpenGL(llvmpipe)
-#                       -> 引擎初始化 + D1 加载  => 1:1 复现飞腾 X100 现场情形
+# Job 2 smoke-gl       : 加 -opengl 强制走 OpenGLDrv/llvmpipe 软渲染,
+#                        验证现场 X100(无 Vulkan 驱动)的唯一可行渲染路径
 #
 # 资产要求: 仓库 Release 必须有 Arm64Probe-LinuxAArch64.tar.gz
 #           (兼容包: TargetedRHIs = SF_VULKAN_SM5 + GLSL_430)
@@ -129,11 +130,14 @@ jobs:
           echo "✅ 冒烟通过"
 
   # ------------------------------------------------------------------------
-  # Job 2: GL 软渲染降级测试（兼容包核心验证点）
-  # 模拟现场: 飞腾 X100 无 Vulkan 驱动 -> 引擎应自动降级 OpenGL(llvmpipe)
-  # 关键: 故意只装 libgl1-mesa-dri(软件GL)，【不装】mesa-vulkan-drivers/libvulkan1
+  # Job 2: OpenGL 软渲染测试（兼容包真正可用的渲染路径）
+  # v7 重大修正: 4.24 Linux 无 Vulkan->GL 自动降级机制(源码证实)!
+  #   VulkanRHI IsSupported() 只看 DISPLAY 环境变量(VulkanLinuxPlatform.cpp)
+  #   有显示即选 Vulkan -> 无 ICD 直接 RequestExit(1), 不会看 GLSL_430
+  #   因此必须显式加 -opengl 强制 OpenGLDrv(IsSupported 恒 true)
+  # 模拟现场: 飞腾 X100 有桌面(DISPLAY存在)但无 Vulkan ICD -> -opengl 是唯一活路
   # ------------------------------------------------------------------------
-  smoke-gl-fallback:
+  smoke-gl:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     needs: smoke-nullrhi
@@ -152,22 +156,22 @@ jobs:
         run: |
           tar -xzf Arm64Probe-LinuxAArch64.tar.gz
 
-      - name: 安装 GL 软渲染依赖（无 Vulkan！）
+      - name: 安装 GL 软渲染依赖（不装 Vulkan 驱动，贴近现场 X100）
         run: |
           set -e
           sudo apt-get update -qq
-          # 只装 GL 栈: llvmpipe 软件渲染; 刻意不装 mesa-vulkan-drivers / libvulkan1
+          # 只装 GL 栈: llvmpipe 软件渲染; 刻意不装 mesa-vulkan-drivers(无 ICD)
           sudo apt-get install -y -qq \
             xvfb libsdl2-2.0-0 \
             libgl1 libgl1-mesa-dri libegl1 libgles2 \
             libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxss1 libxkbcommon0 \
             mesa-utils x11-utils strace gdb >/dev/null 2>&1
-          echo "=== Vulkan 库检查（应缺失 -> 触发降级）==="
-          ldconfig -p 2>/dev/null | grep -i vulkan || echo "OK: 无 Vulkan 库, 符合现场 X100 情形"
-          echo "=== GL 软件渲染检查（应有 llvmpipe/swrast）==="
+          echo "=== Vulkan ICD 检查（预期无 ICD 文件 -> 现场 X100 同款情形）==="
+          ls /usr/share/vulkan/icd.d/ 2>/dev/null || echo "无 /usr/share/vulkan/icd.d (符合预期, 无 Vulkan 驱动)"
+          echo "=== GL 软件渲染检查（应有 swrast/llvmpipe）==="
           ls /usr/lib/aarch64-linux-gnu/dri/ 2>/dev/null | grep -iE "swrast|llvmpipe" || true
 
-      - name: 环境自检 - v5 新增，确认 Xvfb/GL 环境真实可用
+      - name: 环境自检 - v7，确认 Xvfb/GL 环境真实可用
         run: |
           set +e
           LOGS="$GITHUB_WORKSPACE/logs-gl"
@@ -190,24 +194,26 @@ jobs:
           } > "$LOGS/envcheck.txt" 2>&1
           cat "$LOGS/envcheck.txt"
 
-      - name: 真实 RHI 冒烟（期望自动降级 OpenGL/llvmpipe）
+      - name: OpenGL 软渲染冒烟（-opengl 强制 GLSL_430 路径）
         run: |
           set +e
           BIN_DIR="Arm64Probe/Binaries/LinuxAArch64"
           LOGS="$GITHUB_WORKSPACE/logs-gl"
           mkdir -p "$LOGS"
 
-          echo "=== [1] 启动（无 -nullrhi, 真实 RHI; v6: strace 探针 + NOSPLASH; 超时 300s）==="
+          echo "=== [1] 启动（-opengl 强制 OpenGL; strace 探针; 超时 300s）==="
           chmod +x "$BIN_DIR/Arm64Probe"
           cd "$BIN_DIR"
           START=$(date +%s)
           ulimit -c unlimited 2>/dev/null || true
-          # 注意: 不设 SDL_VIDEODRIVER=dummy, 走 xvfb 真实 X11 -> GL 才能初始化
-          # -NOSPLASH: 引擎无启动图时跳过 Splash 路径(源码确认 FParse::Param 命中后 Show() 直接 return), 排除法
-          # strace -f: 捕获进程真实死亡点(最后系统调用/收到的信号), 定位无声 exit(1) 根因
+          # v7: -opengl 是【必须】的, 不是可选项!
+          #   4.24 Linux 有 DISPLAY 时 Vulkan IsSupported()=true -> 必选 Vulkan -> 无 ICD 即死
+          #   -opengl 让 bForceOpenGL=true -> 跳过 Vulkan 分支, 直走 GLSL_430 -> OpenGLDrv
+          # -NOSPLASH: 跳过 Splash 路径(源码确认), 减少变量
+          # strace -f: 若仍异常退出可定位死亡点
           timeout 300 strace -f -tt -o "$LOGS/strace.log" \
             xvfb-run -a -s "-screen 0 1280x720x24" \
-            ./Arm64Probe -NOSPLASH -noaudio -nosound -unattended -log \
+            ./Arm64Probe -opengl -NOSPLASH -noaudio -nosound -unattended -log \
             > "$LOGS/console.log" 2>&1
           RC=$?
           END=$(date +%s)
@@ -217,13 +223,12 @@ jobs:
           sleep 5
 
           echo "=== [2] 汇总 UE 日志 ==="
-          # v5 修正: UE 日志实际位置在解压根目录/Arm64Probe/Saved/Logs/
           cp -r "$GITHUB_WORKSPACE/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || echo "(Saved/Logs 为空或不存在)"
           echo "---- 日志文件清单 ----"
           find "$LOGS" -type f -exec ls -la {} \; | head -20
           cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
           echo "---- RHI 关键行 ----"
-          grep -aiE "vulkan|opengl|llvmpipe|RHI|adapter|renderer" "$LOGS/console.log" "$LOGS/all.log" 2>/dev/null | head -30
+          grep -aiE "vulkan|opengl|llvmpipe|RHI|adapter|renderer|GL_RENDERER" "$LOGS/console.log" "$LOGS/all.log" 2>/dev/null | head -40
           echo "---- 日志尾部 ----"
           tail -40 "$LOGS/all.log"
 
@@ -232,10 +237,9 @@ jobs:
           echo "--- journalctl ---"
           (sudo journalctl -k -n 20 2>/dev/null || journalctl -k -n 20 2>/dev/null) | tail -15 || true
 
-          echo "=== [2.6] strace 死亡点（最后 40 行系统调用，含信号/退出码）==="
-          tail -40 "$LOGS/strace.log" 2>/dev/null || echo "(strace.log 未生成, 可能 strace 不可用)"
-          echo "--- 收到的信号（若为 SIGSEGV/SIGABRT 会有 +++ killed by SIGxxx +++）---"
-          grep -aE "killed by SIG|SIGSEGV|SIGABRT|SIGILL|SIGBUS|exit_group|+++ exited" "$LOGS/strace.log" 2>/dev/null | tail -10 || true
+          echo "=== [2.6] strace 死亡点（最后 30 行系统调用）==="
+          tail -30 "$LOGS/strace.log" 2>/dev/null || echo "(strace.log 未生成)"
+          grep -aE "killed by SIG|SIGSEGV|SIGABRT|SIGILL|SIGBUS|exit_group|+++ exited" "$LOGS/strace.log" 2>/dev/null | tail -8 || true
           echo "--- core 文件检查 ---"
           ls -la core* /tmp/core* "$BIN_DIR"/core* 2>/dev/null || echo "(无 core 文件)"
 
@@ -244,36 +248,33 @@ jobs:
           if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/console.log" "$LOGS/all.log"; then
             RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
           fi
-          # 3a. 引擎初始化
+          # 3a. 若仍出现 Vulkan 弹窗退出 => 说明 -opengl 未生效或包不含 GLSL_430, 直接 FAIL
+          if grep -qiE "Cannot find a compatible Vulkan driver|Vulkan driver.*required" "$LOGS/console.log" "$LOGS/all.log"; then
+            RESULT=FAIL; echo "❌ 仍死在 Vulkan 路径 (-opengl 未生效或包无 GLSL_430 shader), 见日志尾部"
+          fi
+          # 3b. 引擎初始化
           ENGINE_OK=0
           if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/console.log" "$LOGS/all.log"; then
             ENGINE_OK=1; echo "✅ 引擎初始化成功"
           else
             RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
           fi
-          # 3b. D1 地图加载
+          # 3c. D1 地图加载
           if grep -qiE "Bringing World .*D1|LoadMap.*D1" "$LOGS/console.log" "$LOGS/all.log"; then
             echo "✅ 默认地图 D1 加载成功"
           else
             RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志"
           fi
-          # 3c. RHI 路径判定: 期望 Vulkan 失败 -> OpenGL/llvmpipe
-          GL_FALLBACK=0
-          if grep -qiE "vulkan.*(fail|not.*support|unable|error)|unable.*vulkan" "$LOGS/console.log" "$LOGS/all.log"; then
-            echo "ℹ️ 检测到 Vulkan 不可用日志（符合现场预期）"
-            if grep -qiE "opengl|llvmpipe|GL_RENDERER|swrast" "$LOGS/console.log" "$LOGS/all.log"; then
-              GL_FALLBACK=1; echo "✅✅ 自动降级 OpenGL 软渲染成功（兼容包核心验证点通过）"
-            fi
-          elif grep -qiE "llvmpipe|GL_RENDERER" "$LOGS/console.log" "$LOGS/all.log"; then
-            GL_FALLBACK=1; echo "✅✅ 直接以 OpenGL(llvmpipe) 初始化（无 Vulkan 报错日志, 仍为 GL 路径）"
+          # 3d. OpenGL 路径证据: 出现 OpenGL/llvmpipe/GL_RENDERER 任一即视为 GL 生效
+          GL_OK=0
+          if grep -qiE "opengl|llvmpipe|GL_RENDERER|swrast" "$LOGS/console.log" "$LOGS/all.log"; then
+            GL_OK=1; echo "✅✅ OpenGL/llvmpipe 软渲染路径生效（-opengl 成功, 兼容包 GLSL_430 可用）"
+          else
+            echo "⚠️ 未捕获到 OpenGL/llvmpipe 日志, 请人工核对实际渲染路径"
           fi
-          if [ "$GL_FALLBACK" = "0" ]; then
-            # 引擎能初始化但未确认 GL 路径 -> 可能是 runner 意外提供 Vulkan, 记录但不判 FAIL
-            if [ "$ENGINE_OK" = "1" ]; then
-              echo "⚠️ 引擎初始化成功但未捕获到 GL 降级证据, 请下载日志人工确认实际 RHI 路径"
-            else
-              RESULT=FAIL; echo "❌ 引擎未初始化且未确认 GL 降级路径"
-            fi
+          if [ "$ENGINE_OK" = "1" ] && [ "$GL_OK" = "0" ]; then
+            # 引擎起来了但无 GL 证据: 可能走了意外路径, 记录不判 FAIL(看日志定)
+            echo "⚠️ 引擎初始化成功但未捕获 OpenGL 证据, 人工核对日志"
           fi
           if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
             RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒 (退出码 $RC, 137=SIGKILL 查 envcheck/dmesg, 139=段错误)"
@@ -297,4 +298,4 @@ jobs:
             echo "❌ GL 冒烟未通过，请下载 ue-logs-gl 工件查看完整日志"
             exit 1
           fi
-          echo "✅ GL 降级冒烟通过"
+          echo "✅ OpenGL 软渲染冒烟通过"
