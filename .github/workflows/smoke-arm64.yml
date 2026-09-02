@@ -167,7 +167,7 @@ jobs:
           echo "=== GL 软件渲染检查（应有 llvmpipe/swrast）==="
           ls /usr/lib/aarch64-linux-gnu/dri/ 2>/dev/null | grep -iE "swrast|llvmpipe" || true
 
-      - name: 环境自检（v5 新增: 确认 Xvfb/GL 环境真实可用）
+      - name: 环境自检 - v5 新增，确认 Xvfb/GL 环境真实可用
         run: |
           set +e
           LOGS="$GITHUB_WORKSPACE/logs-gl"
