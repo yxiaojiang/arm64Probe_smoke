@@ -161,7 +161,7 @@ jobs:
             xvfb libsdl2-2.0-0 \
             libgl1 libgl1-mesa-dri libegl1 libgles2 \
             libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxss1 libxkbcommon0 \
-            mesa-utils x11-utils >/dev/null 2>&1
+            mesa-utils x11-utils strace gdb >/dev/null 2>&1
           echo "=== Vulkan 库检查（应缺失 -> 触发降级）==="
           ldconfig -p 2>/dev/null | grep -i vulkan || echo "OK: 无 Vulkan 库, 符合现场 X100 情形"
           echo "=== GL 软件渲染检查（应有 llvmpipe/swrast）==="
@@ -197,13 +197,17 @@ jobs:
           LOGS="$GITHUB_WORKSPACE/logs-gl"
           mkdir -p "$LOGS"
 
-          echo "=== [1] 启动（无 -nullrhi, 真实 RHI; 超时 300s）==="
+          echo "=== [1] 启动（无 -nullrhi, 真实 RHI; v6: strace 探针 + NOSPLASH; 超时 300s）==="
           chmod +x "$BIN_DIR/Arm64Probe"
           cd "$BIN_DIR"
           START=$(date +%s)
+          ulimit -c unlimited 2>/dev/null || true
           # 注意: 不设 SDL_VIDEODRIVER=dummy, 走 xvfb 真实 X11 -> GL 才能初始化
-          timeout 300 xvfb-run -a -s "-screen 0 1280x720x24" \
-            ./Arm64Probe -noaudio -nosound -unattended -log \
+          # -NOSPLASH: 引擎无启动图时跳过 Splash 路径(源码确认 FParse::Param 命中后 Show() 直接 return), 排除法
+          # strace -f: 捕获进程真实死亡点(最后系统调用/收到的信号), 定位无声 exit(1) 根因
+          timeout 300 strace -f -tt -o "$LOGS/strace.log" \
+            xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./Arm64Probe -NOSPLASH -noaudio -nosound -unattended -log \
             > "$LOGS/console.log" 2>&1
           RC=$?
           END=$(date +%s)
@@ -227,6 +231,13 @@ jobs:
           (sudo dmesg 2>/dev/null || dmesg 2>/dev/null) | tail -15 || true
           echo "--- journalctl ---"
           (sudo journalctl -k -n 20 2>/dev/null || journalctl -k -n 20 2>/dev/null) | tail -15 || true
+
+          echo "=== [2.6] strace 死亡点（最后 40 行系统调用，含信号/退出码）==="
+          tail -40 "$LOGS/strace.log" 2>/dev/null || echo "(strace.log 未生成, 可能 strace 不可用)"
+          echo "--- 收到的信号（若为 SIGSEGV/SIGABRT 会有 +++ killed by SIGxxx +++）---"
+          grep -aE "killed by SIG|SIGSEGV|SIGABRT|SIGILL|SIGBUS|exit_group|+++ exited" "$LOGS/strace.log" 2>/dev/null | tail -10 || true
+          echo "--- core 文件检查 ---"
+          ls -la core* /tmp/core* "$BIN_DIR"/core* 2>/dev/null || echo "(无 core 文件)"
 
           echo "=== [3] 判定 ==="
           RESULT=PASS
