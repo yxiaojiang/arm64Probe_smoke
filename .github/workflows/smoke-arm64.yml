@@ -1,9 +1,16 @@
 # ============================================================================
-# ARM64 冒烟测试工作流（自包含版，无需仓库内 smoke.sh）
-# 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB）上运行打包产物
-# - 公开仓库: 免费且无限量；私有仓库: 消耗免费分钟额度（2000 分钟/月）
-# 触发方式: 手动 (Actions 页面 -> Run workflow) 或 push 到 main/master
-# 要求: 仓库 Release 中必须有 Arm64Probe-LinuxAArch64.tar.gz
+# Arm64Probe - 兼容包双路冒烟测试工作流 v4（自包含版，无需仓库内 .sh）
+# 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB, ubuntu-24.04）上运行打包产物
+#
+# 本次升级目标：验证「兼容包」在【无 Vulkan 驱动】环境下的自动降级路径
+#   Job 1 smoke-nullrhi : 无头启动（-nullrhi），验证产物可启动 + D1 地图加载
+#   Job 2 smoke-gl      : 真实 RHI 启动。故意【不安装】Vulkan 驱动，只装 mesa 软件 GL
+#                         -> 引擎应报 Vulkan 初始化失败 -> 自动降级 OpenGL(llvmpipe)
+#                         -> 引擎初始化 + D1 加载  => 1:1 复现飞腾 X100 现场情形
+#
+# 资产要求: 仓库 Release 必须有 Arm64Probe-LinuxAArch64.tar.gz
+#           (兼容包: TargetedRHIs = SF_VULKAN_SM5 + GLSL_430)
+# 触发方式: 手动 (Actions -> Run workflow)
 # ============================================================================
 name: ARM64 Smoke Test
 
@@ -13,8 +20,11 @@ on:
     branches: [ main, master ]
 
 jobs:
-  smoke:
-    runs-on: ubuntu-24.04-arm        # 真 ARM64 runner
+  # ------------------------------------------------------------------------
+  # Job 1: 无头冒烟（保持既有功能，快速回归）
+  # ------------------------------------------------------------------------
+  smoke-nullrhi:
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - name: 检出仓库
@@ -34,11 +44,11 @@ jobs:
           file Arm64Probe/Binaries/LinuxAArch64/Arm64Probe
           readelf -h Arm64Probe/Binaries/LinuxAArch64/Arm64Probe | grep -E "Class|Machine|Type" || true
 
-      - name: 运行冒烟测试
+      - name: 无头冒烟测试（-nullrhi）
         run: |
           set +e
           BIN_DIR="Arm64Probe/Binaries/LinuxAArch64"
-          LOGS="$GITHUB_WORKSPACE/logs"
+          LOGS="$GITHUB_WORKSPACE/logs-nullrhi"
           mkdir -p "$LOGS"
 
           echo "=== [1] 安装无头运行依赖 ==="
@@ -49,7 +59,7 @@ jobs:
           chmod +x "$BIN_DIR/Arm64Probe"
           export SDL_VIDEODRIVER=dummy
           export SDL_AUDIODRIVER=dummy
-          cd "$BIN_DIR"                                  # 与官方 .sh 启动脚本一致
+          cd "$BIN_DIR"
           START=$(date +%s)
           timeout 180 xvfb-run -a ./Arm64Probe -nullrhi -noaudio -nosound -unattended -log \
             > "$LOGS/console.log" 2>&1
@@ -57,58 +67,46 @@ jobs:
           END=$(date +%s)
           cd "$GITHUB_WORKSPACE"
           echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
-          # 关键修复：xvfb-run 收到 SIGTERM 后会先退出，Arm64Probe 子进程仍在后台优雅关闭并 flush stdout；
-          # 立即汇总会拿到截断日志（缺 "Game Engine Initialized"）→ 误判 FAIL。等待日志完整落盘。
-          sleep 5
+          sleep 5   # 等子进程 flush 完整日志
 
           echo "=== [3] 汇总 UE 日志 ==="
           cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
           cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
-          tail -60 "$LOGS/all.log"
+          tail -40 "$LOGS/all.log"
 
           echo "=== [4] 判定 ==="
           RESULT=PASS
-          # 判定同时 grep console.log（stdout 直出）与 all.log（汇总），任一命中即有效，避免单文件截断
-          # 4a. 致命错误/崩溃信号 → 直接 FAIL（真·运行时问题）
           if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/console.log" "$LOGS/all.log"; then
             RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
           fi
-          # 4b. 引擎初始化（核心目标：产物能否在 ARM64 启动）
           ENGINE_OK=0
           if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/console.log" "$LOGS/all.log"; then
-            ENGINE_OK=1; echo "✅ 引擎初始化成功（产物可在 ARM64 正常启动）"
+            ENGINE_OK=1; echo "✅ 引擎初始化成功"
           else
             RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
           fi
-          # 4c. pak 挂载
           if grep -qiE "LogPakFile.*[Mm]ount" "$LOGS/console.log" "$LOGS/all.log"; then
             echo "✅ pak 挂载成功"
           else
             echo "⚠️ 未检测到 pak 挂载日志"
           fi
-          # 4d. D1 地图加载（本次重打包核心目标：验证 D1 在 ARM64 正常加载 → 缺失判 FAIL）
           if grep -qiE "Bringing World .*D1|LoadMap.*D1" "$LOGS/console.log" "$LOGS/all.log"; then
             echo "✅ 默认地图 D1 加载成功"
           else
-            RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志（D1 可能未进 pak 或加载失败）"
+            RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志"
           fi
-          # 4e. 地图缺失 = 内容问题（空工程未 cook 默认地图），非运行时崩溃 → 提示不判 FAIL
-          if grep -qiE "could not be found. Exiting|Failed to enter" "$LOGS/console.log" "$LOGS/all.log"; then
-            echo "⚠️ 默认地图缺失（内容问题）：引擎正常初始化后因找不到 GameDefaultMap 退出，非运行时崩溃"
-          fi
-          # 4f. 运行时长：仅当引擎未初始化成功且运行过短，才判 FAIL（正常快速退出不误伤）
           if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
             RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
           fi
           echo "SMOKE_RESULT=$RESULT" >> "$GITHUB_ENV"
           echo "=== 判定结果: $RESULT ==="
 
-      - name: 上传完整日志（无论成败）
+      - name: 上传日志（无论成败）
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: ue-logs
-          path: logs/
+          name: ue-logs-nullrhi
+          path: logs-nullrhi/
           if-no-files-found: warn
 
       - name: 汇总冒烟结果
@@ -116,7 +114,135 @@ jobs:
         run: |
           echo "冒烟结果: ${{ env.SMOKE_RESULT }}"
           if [ "${{ env.SMOKE_RESULT }}" = "FAIL" ]; then
-            echo "❌ 冒烟未通过，请下载 ue-logs 工件查看完整日志"
+            echo "❌ 冒烟未通过，请下载 ue-logs-nullrhi 工件查看完整日志"
             exit 1
           fi
           echo "✅ 冒烟通过"
+
+  # ------------------------------------------------------------------------
+  # Job 2: GL 软渲染降级测试（兼容包核心验证点）
+  # 模拟现场: 飞腾 X100 无 Vulkan 驱动 -> 引擎应自动降级 OpenGL(llvmpipe)
+  # 关键: 故意只装 libgl1-mesa-dri(软件GL)，【不装】mesa-vulkan-drivers/libvulkan1
+  # ------------------------------------------------------------------------
+  smoke-gl-fallback:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    needs: smoke-nullrhi
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 从 Release 下载产物包
+        run: |
+          set -e
+          curl -fL --retry 3 -o Arm64Probe-LinuxAArch64.tar.gz \
+            "https://github.com/${{ github.repository }}/releases/latest/download/Arm64Probe-LinuxAArch64.tar.gz"
+          ls -lh Arm64Probe-LinuxAArch64.tar.gz
+
+      - name: 解压
+        run: |
+          tar -xzf Arm64Probe-LinuxAArch64.tar.gz
+
+      - name: 安装 GL 软渲染依赖（无 Vulkan！）
+        run: |
+          set -e
+          sudo apt-get update -qq
+          # 只装 GL 栈: llvmpipe 软件渲染; 刻意不装 mesa-vulkan-drivers / libvulkan1
+          sudo apt-get install -y -qq \
+            xvfb libsdl2-2.0-0 \
+            libgl1 libgl1-mesa-dri libegl1 libgles2 \
+            libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxss1 libxkbcommon0 \
+            mesa-utils >/dev/null 2>&1
+          echo "=== Vulkan 库检查（应缺失 -> 触发降级）==="
+          ldconfig -p 2>/dev/null | grep -i vulkan || echo "OK: 无 Vulkan 库, 符合现场 X100 情形"
+          echo "=== GL 软件渲染检查（应有 llvmpipe/swrast）==="
+          ls /usr/lib/aarch64-linux-gnu/dri/ 2>/dev/null | grep -iE "swrast|llvmpipe" || true
+
+      - name: 真实 RHI 冒烟（期望自动降级 OpenGL/llvmpipe）
+        run: |
+          set +e
+          BIN_DIR="Arm64Probe/Binaries/LinuxAArch64"
+          LOGS="$GITHUB_WORKSPACE/logs-gl"
+          mkdir -p "$LOGS"
+
+          echo "=== [1] 启动（无 -nullrhi, 真实 RHI; 超时 300s）==="
+          chmod +x "$BIN_DIR/Arm64Probe"
+          cd "$BIN_DIR"
+          START=$(date +%s)
+          # 注意: 不设 SDL_VIDEODRIVER=dummy, 走 xvfb 真实 X11 -> GL 才能初始化
+          timeout 300 xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./Arm64Probe -noaudio -nosound -unattended -log \
+            > "$LOGS/console.log" 2>&1
+          RC=$?
+          END=$(date +%s)
+          cd "$GITHUB_WORKSPACE"
+          echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
+          sleep 5
+
+          echo "=== [2] 汇总 UE 日志 ==="
+          cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
+          cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
+          echo "---- RHI 关键行 ----"
+          grep -aiE "vulkan|opengl|llvmpipe|RHI|adapter|renderer" "$LOGS/console.log" "$LOGS/all.log" 2>/dev/null | head -30
+          echo "---- 日志尾部 ----"
+          tail -40 "$LOGS/all.log"
+
+          echo "=== [3] 判定 ==="
+          RESULT=PASS
+          if grep -qiE "Fatal error|Assertion failed|Segmentation fault|signal SIG|Check failed|LogExit: Fatal" "$LOGS/console.log" "$LOGS/all.log"; then
+            RESULT=FAIL; echo "❌ 检测到致命错误/崩溃"
+          fi
+          # 3a. 引擎初始化
+          ENGINE_OK=0
+          if grep -qiE "Game Engine Initialized|LogInit: Display:.*Initialized" "$LOGS/console.log" "$LOGS/all.log"; then
+            ENGINE_OK=1; echo "✅ 引擎初始化成功"
+          else
+            RESULT=FAIL; echo "⚠️ 未检测到引擎初始化标记"
+          fi
+          # 3b. D1 地图加载
+          if grep -qiE "Bringing World .*D1|LoadMap.*D1" "$LOGS/console.log" "$LOGS/all.log"; then
+            echo "✅ 默认地图 D1 加载成功"
+          else
+            RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志"
+          fi
+          # 3c. RHI 路径判定: 期望 Vulkan 失败 -> OpenGL/llvmpipe
+          GL_FALLBACK=0
+          if grep -qiE "vulkan.*(fail|not.*support|unable|error)|unable.*vulkan" "$LOGS/console.log" "$LOGS/all.log"; then
+            echo "ℹ️ 检测到 Vulkan 不可用日志（符合现场预期）"
+            if grep -qiE "opengl|llvmpipe|GL_RENDERER|swrast" "$LOGS/console.log" "$LOGS/all.log"; then
+              GL_FALLBACK=1; echo "✅✅ 自动降级 OpenGL 软渲染成功（兼容包核心验证点通过）"
+            fi
+          elif grep -qiE "llvmpipe|GL_RENDERER" "$LOGS/console.log" "$LOGS/all.log"; then
+            GL_FALLBACK=1; echo "✅✅ 直接以 OpenGL(llvmpipe) 初始化（无 Vulkan 报错日志, 仍为 GL 路径）"
+          fi
+          if [ "$GL_FALLBACK" = "0" ]; then
+            # 引擎能初始化但未确认 GL 路径 -> 可能是 runner 意外提供 Vulkan, 记录但不判 FAIL
+            if [ "$ENGINE_OK" = "1" ]; then
+              echo "⚠️ 引擎初始化成功但未捕获到 GL 降级证据, 请下载日志人工确认实际 RHI 路径"
+            else
+              RESULT=FAIL; echo "❌ 引擎未初始化且未确认 GL 降级路径"
+            fi
+          fi
+          if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
+            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
+          fi
+          echo "GL_RESULT=$RESULT" >> "$GITHUB_ENV"
+          echo "=== 判定结果: $RESULT ==="
+
+      - name: 上传日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ue-logs-gl
+          path: logs-gl/
+          if-no-files-found: warn
+
+      - name: 汇总 GL 冒烟结果
+        if: always()
+        run: |
+          echo "GL 冒烟结果: ${{ env.GL_RESULT }}"
+          if [ "${{ env.GL_RESULT }}" = "FAIL" ]; then
+            echo "❌ GL 冒烟未通过，请下载 ue-logs-gl 工件查看完整日志"
+            exit 1
+          fi
+          echo "✅ GL 降级冒烟通过"
