@@ -1,12 +1,18 @@
 # ============================================================================
-# Arm64Probe - 兼容包双路冒烟测试工作流 v4（自包含版，无需仓库内 .sh）
+# Arm64Probe - 兼容包双路冒烟测试工作流 v5（自包含版，无需仓库内 .sh）
 # 在真 ARM64 硬件（Cobalt 100, 4 vCPU/16GB, ubuntu-24.04）上运行打包产物
 #
-# 本次升级目标：验证「兼容包」在【无 Vulkan 驱动】环境下的自动降级路径
-#   Job 1 smoke-nullrhi : 无头启动（-nullrhi），验证产物可启动 + D1 地图加载
-#   Job 2 smoke-gl      : 真实 RHI 启动。故意【不安装】Vulkan 驱动，只装 mesa 软件 GL
-#                         -> 引擎应报 Vulkan 初始化失败 -> 自动降级 OpenGL(llvmpipe)
-#                         -> 引擎初始化 + D1 加载  => 1:1 复现飞腾 X100 现场情形
+# v5 修复（针对 2026-09-02 首跑 GL job 引擎秒死无日志的排障迭代）:
+#   1. 修正 UE 自带日志(Saved/Logs)抓取路径: 打包游戏日志在解压根目录下的
+#      Arm64Probe/Saved/Logs/, 旧版写 $HOME/Documents/... 路径错误从未抓到
+#   2. 退出码写入工件文件 exitcode.txt (137=SIGKILL/OOM, 139=SIGSEGV, 132=SIGILL)
+#   3. Job2 启动前做环境自检(envcheck.txt): xdpyinfo/glxinfo/ldconfig/llvmpipe
+#   4. 进程退出后抓 dmesg/journalctl 查 OOM killer 痕迹
+#
+# Job 1 smoke-nullrhi : 无头启动（-nullrhi），验证产物可启动 + D1 地图加载
+# Job 2 smoke-gl      : 真实 RHI 启动。故意【不安装】Vulkan 驱动，只装 mesa 软件 GL
+#                       -> 引擎应报 Vulkan 初始化失败 -> 自动降级 OpenGL(llvmpipe)
+#                       -> 引擎初始化 + D1 加载  => 1:1 复现飞腾 X100 现场情形
 #
 # 资产要求: 仓库 Release 必须有 Arm64Probe-LinuxAArch64.tar.gz
 #           (兼容包: TargetedRHIs = SF_VULKAN_SM5 + GLSL_430)
@@ -65,12 +71,15 @@ jobs:
             > "$LOGS/console.log" 2>&1
           RC=$?
           END=$(date +%s)
+          echo "$RC" > "$LOGS/exitcode.txt"
           cd "$GITHUB_WORKSPACE"
-          echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
+          echo "运行时长: $((END-START))s   退出码: $RC (0=引擎自退, 124=超时自动终止, 137=SIGKILL, 139=段错误)"
           sleep 5   # 等子进程 flush 完整日志
 
           echo "=== [3] 汇总 UE 日志 ==="
-          cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
+          # UE 打包游戏日志位置: 解压根目录/Arm64Probe/Saved/Logs/ (v5 修正, 旧版路径错误)
+          cp -r "$GITHUB_WORKSPACE/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || echo "(Saved/Logs 为空或不存在)"
+          find "$LOGS" -type f | head -20
           cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
           tail -40 "$LOGS/all.log"
 
@@ -96,7 +105,7 @@ jobs:
             RESULT=FAIL; echo "❌ 未检测到 D1 地图加载日志"
           fi
           if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
-            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
+            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒 (退出码 $RC, 详见 exitcode.txt)"
           fi
           echo "SMOKE_RESULT=$RESULT" >> "$GITHUB_ENV"
           echo "=== 判定结果: $RESULT ==="
@@ -152,11 +161,34 @@ jobs:
             xvfb libsdl2-2.0-0 \
             libgl1 libgl1-mesa-dri libegl1 libgles2 \
             libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxss1 libxkbcommon0 \
-            mesa-utils >/dev/null 2>&1
+            mesa-utils x11-utils >/dev/null 2>&1
           echo "=== Vulkan 库检查（应缺失 -> 触发降级）==="
           ldconfig -p 2>/dev/null | grep -i vulkan || echo "OK: 无 Vulkan 库, 符合现场 X100 情形"
           echo "=== GL 软件渲染检查（应有 llvmpipe/swrast）==="
           ls /usr/lib/aarch64-linux-gnu/dri/ 2>/dev/null | grep -iE "swrast|llvmpipe" || true
+
+      - name: 环境自检（v5 新增: 确认 Xvfb/GL 环境真实可用）
+        run: |
+          set +e
+          LOGS="$GITHUB_WORKSPACE/logs-gl"
+          mkdir -p "$LOGS"
+          {
+            echo "===== envcheck $(date -u +%Y%m%d-%H%M%S) ====="
+            echo "--- uname ---"; uname -a
+            echo "--- 内存 ---"; free -h
+            echo "--- 磁盘 ---"; df -h "$GITHUB_WORKSPACE" | tail -1
+            echo "--- DISPLAY ---"; echo "DISPLAY=$DISPLAY"
+            echo "--- Xvfb 试启动 ---"
+            xvfb-run -a -s "-screen 0 1280x720x24" sh -c 'echo XVFB_OK DISPLAY=$DISPLAY; xdpyinfo | head -5' 2>&1
+            echo "--- glxinfo(软渲染) ---"
+            xvfb-run -a -s "-screen 0 1280x720x24" glxinfo -B 2>&1 | head -15
+            echo "--- ldconfig GL 相关库 ---"
+            ldconfig -p 2>/dev/null | grep -iE "libGL\.|libEGL|libGLX|libvulkan|libSDL2" | head -15
+            echo "--- dri 驱动文件 ---"
+            ls -la /usr/lib/aarch64-linux-gnu/dri/ 2>/dev/null | grep -iE "swrast|llvmpipe|kms" | head -5
+            echo "===== envcheck end ====="
+          } > "$LOGS/envcheck.txt" 2>&1
+          cat "$LOGS/envcheck.txt"
 
       - name: 真实 RHI 冒烟（期望自动降级 OpenGL/llvmpipe）
         run: |
@@ -175,17 +207,26 @@ jobs:
             > "$LOGS/console.log" 2>&1
           RC=$?
           END=$(date +%s)
+          echo "$RC" > "$LOGS/exitcode.txt"
           cd "$GITHUB_WORKSPACE"
-          echo "运行时长: $((END-START))s   退出码: $RC (124=超时自动终止, 属预期)"
+          echo "运行时长: $((END-START))s   退出码: $RC (0=引擎自退, 124=超时自动终止, 137=SIGKILL/OOM, 139=段错误, 132=非法指令)"
           sleep 5
 
           echo "=== [2] 汇总 UE 日志 ==="
-          cp -r "$HOME/Documents/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || true
+          # v5 修正: UE 日志实际位置在解压根目录/Arm64Probe/Saved/Logs/
+          cp -r "$GITHUB_WORKSPACE/Arm64Probe/Saved/Logs/." "$LOGS/" 2>/dev/null || echo "(Saved/Logs 为空或不存在)"
+          echo "---- 日志文件清单 ----"
+          find "$LOGS" -type f -exec ls -la {} \; | head -20
           cat "$LOGS"/*.log 2>/dev/null > "$LOGS/all.log"
           echo "---- RHI 关键行 ----"
           grep -aiE "vulkan|opengl|llvmpipe|RHI|adapter|renderer" "$LOGS/console.log" "$LOGS/all.log" 2>/dev/null | head -30
           echo "---- 日志尾部 ----"
           tail -40 "$LOGS/all.log"
+
+          echo "=== [2.5] 查 OOM killer / 内核杀进程痕迹 ==="
+          (sudo dmesg 2>/dev/null || dmesg 2>/dev/null) | tail -15 || true
+          echo "--- journalctl ---"
+          (sudo journalctl -k -n 20 2>/dev/null || journalctl -k -n 20 2>/dev/null) | tail -15 || true
 
           echo "=== [3] 判定 ==="
           RESULT=PASS
@@ -224,7 +265,7 @@ jobs:
             fi
           fi
           if [ "$ENGINE_OK" = "0" ] && [ $((END-START)) -lt 10 ]; then
-            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒"
+            RESULT=FAIL; echo "⚠️ 引擎未初始化且运行不足 10 秒 (退出码 $RC, 137=SIGKILL 查 envcheck/dmesg, 139=段错误)"
           fi
           echo "GL_RESULT=$RESULT" >> "$GITHUB_ENV"
           echo "=== 判定结果: $RESULT ==="
